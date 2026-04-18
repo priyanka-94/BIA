@@ -1,0 +1,8 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.python-version
+hr_leave_management.db
