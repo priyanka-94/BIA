@@ -8,3 +8,4 @@ dependencies = [
     "mcp[cli]>=1.14.1",
     "pandas>=2.3.2",
 ]
+pyproject.toml

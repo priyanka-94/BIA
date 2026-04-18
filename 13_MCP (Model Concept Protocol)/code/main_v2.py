@@ -4,6 +4,13 @@ import sqlite3
 import os
 from datetime import datetime, date
 import json
+import uvicorn
+from contextlib import asynccontextmanager
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import HTMLResponse
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hr_leave_management.db")
 
@@ -70,13 +77,308 @@ def init_database():
 init_database()
 
 # Create MCP server
-mcp = FastMCP("HRLeaveManager")
+mcp = FastMCP("HRLeaveManager", streamable_http_path="/")
 
 
 # Helper functions
 def get_db_connection():
     """Get database connection"""
     return sqlite3.connect(DATABASE_PATH)
+
+
+def execute_read_only_query(sql: str):
+    """Execute a read-only SQL query and return columns and rows."""
+    cleaned_sql = sql.strip().rstrip(";")
+    if not cleaned_sql:
+        raise ValueError("SQL query is required.")
+
+    normalized_sql = cleaned_sql.lower()
+    if not normalized_sql.startswith("select"):
+        raise ValueError("Only SELECT queries are allowed.")
+
+    blocked_terms = (
+        "insert",
+        "update",
+        "delete",
+        "drop",
+        "alter",
+        "create",
+        "replace",
+        "truncate",
+        "attach",
+        "detach",
+        "pragma",
+    )
+    if any(term in normalized_sql for term in blocked_terms):
+        raise ValueError("Only read-only SELECT queries are allowed.")
+
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute(cleaned_sql)
+        rows = [dict(row) for row in cursor.fetchall()]
+        columns = [description[0] for description in cursor.description or []]
+        return columns, rows
+    finally:
+        conn.close()
+
+
+def render_query_page(sql: str = "", results: Optional[dict] = None, error: Optional[str] = None) -> str:
+    """Render a simple browser UI for interactive SQL queries."""
+    escaped_sql = json.dumps(sql)[1:-1]
+
+    if error:
+        result_block = f"""
+        <div class="card error">
+            <strong>Error:</strong> {error}
+        </div>
+        """
+    elif results is not None:
+        headers = "".join(f"<th>{column}</th>" for column in results["columns"])
+        rows_html = ""
+        for row in results["rows"]:
+            rows_html += "<tr>" + "".join(f"<td>{row.get(column, '')}</td>" for column in results["columns"]) + "</tr>"
+
+        table_html = (
+            f"""
+            <table>
+                <thead>
+                    <tr>{headers}</tr>
+                </thead>
+                <tbody>
+                    {rows_html or '<tr><td colspan="100%">No rows returned.</td></tr>'}
+                </tbody>
+            </table>
+            """
+            if results["columns"]
+            else "<p>No columns returned.</p>"
+        )
+
+        result_block = f"""
+        <div class="card">
+            <div class="meta">
+                <span><strong>Rows:</strong> {results["row_count"]}</span>
+            </div>
+            {table_html}
+        </div>
+        """
+    else:
+        result_block = """
+        <div class="card hint">
+            <p>Enter any read-only <code>SELECT</code> query and run it directly from your browser.</p>
+            <p>Examples:</p>
+            <pre>SELECT * FROM employees;
+SELECT employee_id, name, leave_balance FROM employees ORDER BY name;
+SELECT department, COUNT(*) AS employee_count FROM employees GROUP BY department;</pre>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Database Query</title>
+        <style>
+            :root {{
+                color-scheme: light;
+                --bg: #f4efe6;
+                --panel: #fffdf8;
+                --ink: #1f2937;
+                --muted: #6b7280;
+                --accent: #0f766e;
+                --accent-soft: #dff6f3;
+                --error: #b91c1c;
+                --error-soft: #fee2e2;
+                --border: #d6d3d1;
+            }}
+            body {{
+                margin: 0;
+                font-family: Georgia, "Times New Roman", serif;
+                background: linear-gradient(160deg, #f4efe6 0%, #efe7db 100%);
+                color: var(--ink);
+            }}
+            .page {{
+                max-width: 980px;
+                margin: 40px auto;
+                padding: 0 20px 40px;
+            }}
+            h1 {{
+                margin-bottom: 8px;
+            }}
+            p {{
+                color: var(--muted);
+            }}
+            .card {{
+                background: var(--panel);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 18px;
+                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.06);
+                margin-top: 18px;
+            }}
+            .hint {{
+                background: var(--accent-soft);
+            }}
+            .error {{
+                background: var(--error-soft);
+                color: var(--error);
+            }}
+            textarea {{
+                width: 100%;
+                min-height: 140px;
+                border-radius: 12px;
+                border: 1px solid var(--border);
+                padding: 14px;
+                font: 14px/1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+                box-sizing: border-box;
+                resize: vertical;
+                background: #fff;
+                color: var(--ink);
+            }}
+            .actions {{
+                display: flex;
+                gap: 12px;
+                margin-top: 14px;
+                flex-wrap: wrap;
+            }}
+            button {{
+                border: 0;
+                border-radius: 999px;
+                padding: 12px 18px;
+                background: var(--accent);
+                color: white;
+                font-weight: 600;
+                cursor: pointer;
+            }}
+            a {{
+                color: var(--accent);
+                text-decoration: none;
+            }}
+            .meta {{
+                margin-bottom: 12px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                overflow-x: auto;
+                display: block;
+            }}
+            th, td {{
+                border-bottom: 1px solid var(--border);
+                padding: 10px 12px;
+                text-align: left;
+                white-space: nowrap;
+            }}
+            th {{
+                background: #f7f7f5;
+            }}
+            code, pre {{
+                font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+            }}
+            pre {{
+                white-space: pre-wrap;
+            }}
+        </style>
+    </head>
+    <body>
+        <main class="page">
+            <h1>Database Query Console</h1>
+            <p>Run your own SQLite <code>SELECT</code> queries from localhost. Write a query below and submit it.</p>
+            <form method="get" action="/database_query" class="card">
+                <textarea name="sql" placeholder="SELECT * FROM employees;">{escaped_sql}</textarea>
+                <div class="actions">
+                    <button type="submit">Run Query</button>
+                    <a href="/database_query">Clear</a>
+                </div>
+            </form>
+            {result_block}
+        </main>
+    </body>
+    </html>
+    """
+
+
+def get_mcp_tool_names() -> List[str]:
+    """Return the registered MCP tool names for display and debugging."""
+    return [tool.name for tool in mcp._tool_manager.list_tools()]
+
+
+def get_mcp_tool_catalog() -> List[dict]:
+    """Return basic metadata for registered MCP tools."""
+    catalog = []
+    for tool in mcp._tool_manager.list_tools():
+        catalog.append(
+            {
+                "name": tool.name,
+                "description": getattr(tool, "description", "") or "",
+                "input_schema": getattr(tool, "parameters", {}) or {},
+            }
+        )
+    return catalog
+
+
+def get_mcp_tool_examples() -> dict:
+    """Return example JSON arguments for each MCP tool."""
+    return {
+        "add_employee": {
+            "employee_id": "E006",
+            "name": "Babu",
+            "email": "babu@company.com",
+            "department": "Engineering",
+            "position": "Developer",
+            "initial_leave_balance": 20,
+        },
+        "remove_employee": {
+            "employee_id": "E006",
+        },
+        "update_leave_balance": {
+            "employee_id": "E001",
+            "new_balance": 25,
+            "reason": "Manual adjustment",
+        },
+        "list_employees": {},
+        "get_employee_details": {
+            "employee_id": "E001",
+        },
+        "get_leave_balance": {
+            "employee_id": "E001",
+        },
+        "apply_leave": {
+            "employee_id": "E001",
+            "leave_dates": ["2026-04-21", "2026-04-22"],
+            "leave_type": "Annual",
+        },
+        "get_leave_history": {
+            "employee_id": "E001",
+        },
+        "get_department_summary": {
+            "department": "Engineering",
+        },
+        "get_recent_leave_activity": {
+            "days": 30,
+        },
+    }
+
+
+def get_default_arguments_json(tool_name: str) -> str:
+    """Return formatted example JSON for the selected tool."""
+    examples = get_mcp_tool_examples()
+    return json.dumps(examples.get(tool_name, {}), indent=2)
+
+
+async def run_mcp_tool(tool_name: str, arguments: dict):
+    """Execute a registered MCP tool directly for browser/API usage."""
+    if not tool_name:
+        raise ValueError("Tool name is required.")
+
+    tool = mcp._tool_manager.get_tool(tool_name)
+    if tool is None:
+        raise ValueError(f"Unknown tool: {tool_name}")
+
+    return await mcp._tool_manager.call_tool(tool_name, arguments, convert_result=True)
 
 
 def employee_exists(employee_id: str) -> bool:
@@ -625,8 +927,292 @@ def init_sample_data():
 init_sample_data()
 
 
+async def database_query(request: Request):
+    """HTTP endpoint for running read-only database queries."""
+    sql = request.query_params.get("sql", "").strip()
+
+    if request.method == "GET" and not sql:
+        return HTMLResponse(render_query_page())
+
+    if request.method == "POST":
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        sql = str(payload.get("sql", sql)).strip()
+
+    try:
+        columns, rows = execute_read_only_query(sql)
+        result = {
+            "query": sql,
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+        }
+        if request.method == "GET":
+            return HTMLResponse(render_query_page(sql=sql, results=result))
+        return JSONResponse(result)
+    except ValueError as exc:
+        if request.method == "GET":
+            return HTMLResponse(render_query_page(sql=sql, error=str(exc)), status_code=400)
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except sqlite3.Error as exc:
+        if request.method == "GET":
+            return HTMLResponse(render_query_page(sql=sql, error=f"Database error: {exc}"), status_code=400)
+        return JSONResponse({"error": f"Database error: {exc}"}, status_code=400)
+
+
+async def healthcheck(_: Request) -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "ok",
+            "database_path": DATABASE_PATH,
+            "database_query_endpoint": "/database_query",
+            "mcp_endpoint": "/mcp/rpc",
+            "mcp_tools": get_mcp_tool_names(),
+        }
+    )
+
+
+async def mcp_info(_: Request) -> JSONResponse:
+    return JSONResponse(
+        {
+            "name": "HRLeaveManager",
+            "transport": "streamable-http",
+            "endpoint": "/mcp/rpc",
+            "description": "MCP endpoint for HR leave management tools backed by the SQLite database.",
+            "tools": get_mcp_tool_names(),
+        }
+    )
+
+
+def render_mcp_page(selected_tool: str = "", arguments_json: str = "{}", result: Optional[str] = None, error: Optional[str] = None) -> str:
+    """Render a browser console for invoking HR Leave MCP tools."""
+    catalog = get_mcp_tool_catalog()
+    examples_json = json.dumps({tool["name"]: get_default_arguments_json(tool["name"]) for tool in catalog})
+    if not selected_tool and catalog:
+        selected_tool = catalog[0]["name"]
+    if arguments_json == "{}" and selected_tool:
+        arguments_json = get_default_arguments_json(selected_tool)
+    tool_options = "".join(
+        f"<option value=\"{tool['name']}\"{' selected' if tool['name'] == selected_tool else ''}>{tool['name']}</option>"
+        for tool in catalog
+    )
+
+    tool_cards = ""
+    for tool in catalog:
+        schema_preview = json.dumps(tool["input_schema"], indent=2)
+        tool_cards += f"""
+        <details class="tool-card">
+            <summary><code>{tool['name']}</code></summary>
+            <p>{tool['description'] or 'No description available.'}</p>
+            <pre>{schema_preview}</pre>
+        </details>
+        """
+
+    result_block = ""
+    if error:
+        result_block = f'<div class="card error"><strong>Error:</strong> {error}</div>'
+    elif result is not None:
+        result_block = f'<div class="card"><h2>Result</h2><pre>{result}</pre></div>'
+
+    return (
+        f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>HR Leave MCP</title>
+            <style>
+                body {{
+                    margin: 0;
+                    font-family: Georgia, "Times New Roman", serif;
+                    background: linear-gradient(160deg, #f4efe6 0%, #efe7db 100%);
+                    color: #1f2937;
+                }}
+                main {{
+                    max-width: 900px;
+                    margin: 40px auto;
+                    padding: 0 20px 40px;
+                }}
+                .card {{
+                    background: #fffdf8;
+                    border: 1px solid #d6d3d1;
+                    border-radius: 16px;
+                    padding: 20px;
+                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.06);
+                    margin-top: 18px;
+                }}
+                .error {{
+                    background: #fee2e2;
+                    color: #b91c1c;
+                }}
+                code {{
+                    font-family: "SFMono-Regular", Consolas, monospace;
+                }}
+                select, textarea {{
+                    width: 100%;
+                    box-sizing: border-box;
+                    border-radius: 12px;
+                    border: 1px solid #d6d3d1;
+                    padding: 12px;
+                    font: 14px/1.5 "SFMono-Regular", Consolas, monospace;
+                    background: #fff;
+                    color: #1f2937;
+                }}
+                textarea {{
+                    min-height: 180px;
+                    resize: vertical;
+                }}
+                button {{
+                    border: 0;
+                    border-radius: 999px;
+                    padding: 12px 18px;
+                    background: #0f766e;
+                    color: white;
+                    font-weight: 600;
+                    cursor: pointer;
+                    margin-top: 14px;
+                }}
+                a {{
+                    color: #0f766e;
+                    text-decoration: none;
+                }}
+                pre {{
+                    white-space: pre-wrap;
+                    overflow-wrap: anywhere;
+                }}
+                .tool-card {{
+                    margin-top: 12px;
+                    border-top: 1px solid #e7e5e4;
+                    padding-top: 12px;
+                }}
+            </style>
+        </head>
+        <body>
+            <main>
+                <h1>HR Leave MCP Console</h1>
+                <p>Use this page to run the HR Leave MCP tools from localhost. The low-level MCP client endpoint remains <code>/mcp/rpc</code>.</p>
+                <div class="card">
+                    <form method="get" action="/mcp">
+                        <label for="tool"><strong>Tool</strong></label>
+                        <select id="tool" name="tool">{tool_options}</select>
+                        <p><strong>Arguments JSON</strong></p>
+                        <textarea id="arguments" name="arguments">{arguments_json}</textarea>
+                        <button type="submit">Run Tool</button>
+                    </form>
+                </div>
+                {result_block}
+                <div class="card">
+                    <p><strong>MCP transport endpoint:</strong> <code>http://127.0.0.1:8000/mcp/rpc</code></p>
+                    <p><strong>Browser/API tool endpoint:</strong> <code>http://127.0.0.1:8000/mcp/query</code></p>
+                    <p><strong>Metadata endpoint:</strong> <a href="/mcp-info">/mcp-info</a></p>
+                    <p><strong>Registered HR tools:</strong></p>
+                    {tool_cards}
+                </div>
+            </main>
+        </body>
+        <script>
+            const toolExamples = {examples_json};
+            const toolSelect = document.getElementById("tool");
+            const argumentsBox = document.getElementById("arguments");
+            let lastAutoValue = argumentsBox.value;
+
+            toolSelect.addEventListener("change", () => {{
+                const nextValue = toolExamples[toolSelect.value] || "{{}}";
+                if (argumentsBox.value.trim() === "" || argumentsBox.value === lastAutoValue) {{
+                    argumentsBox.value = nextValue;
+                }}
+                lastAutoValue = nextValue;
+            }});
+        </script>
+    </html>
+        """
+    )
+
+
+async def mcp_home(request: Request) -> HTMLResponse:
+    tool_name = request.query_params.get("tool", "").strip()
+    arguments_json = request.query_params.get("arguments", "{}")
+
+    if not tool_name:
+        default_tool = get_mcp_tool_names()[0] if get_mcp_tool_names() else ""
+        return HTMLResponse(render_mcp_page(selected_tool=default_tool, arguments_json="{}"))
+
+    try:
+        arguments = json.loads(arguments_json or "{}")
+        if not isinstance(arguments, dict):
+            raise ValueError("Arguments JSON must be an object.")
+        result = await run_mcp_tool(tool_name, arguments)
+        pretty_result = json.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result)
+        return HTMLResponse(render_mcp_page(selected_tool=tool_name, arguments_json=arguments_json, result=pretty_result))
+    except json.JSONDecodeError as exc:
+        return HTMLResponse(
+            render_mcp_page(selected_tool=tool_name, arguments_json=arguments_json, error=f"Invalid JSON: {exc}"),
+            status_code=400,
+        )
+    except Exception as exc:
+        return HTMLResponse(
+            render_mcp_page(selected_tool=tool_name, arguments_json=arguments_json, error=str(exc)),
+            status_code=400,
+        )
+
+
+async def mcp_query(request: Request) -> JSONResponse:
+    tool_name = request.query_params.get("tool", "").strip()
+    arguments: dict = {}
+
+    if request.method == "POST":
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return JSONResponse({"error": "Request body must be valid JSON."}, status_code=400)
+        tool_name = str(payload.get("tool", tool_name)).strip()
+        raw_arguments = payload.get("arguments", {})
+        if not isinstance(raw_arguments, dict):
+            return JSONResponse({"error": "The `arguments` field must be a JSON object."}, status_code=400)
+        arguments = raw_arguments
+    else:
+        raw_arguments = request.query_params.get("arguments", "{}")
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            return JSONResponse({"error": f"Invalid JSON in `arguments`: {exc}"}, status_code=400)
+        if not isinstance(arguments, dict):
+            return JSONResponse({"error": "The `arguments` field must decode to a JSON object."}, status_code=400)
+
+    try:
+        result = await run_mcp_tool(tool_name, arguments)
+        return JSONResponse({"tool": tool_name, "arguments": arguments, "result": result})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+mcp_http_app = mcp.streamable_http_app()
+
+
+@asynccontextmanager
+async def app_lifespan(_: Starlette):
+    async with mcp.session_manager.run():
+        yield
+
+
+app = Starlette(
+    lifespan=app_lifespan,
+    routes=[
+        Route("/", healthcheck),
+        Route("/mcp", mcp_home),
+        Route("/mcp-info", mcp_info),
+        Route("/mcp/query", mcp_query, methods=["GET", "POST"]),
+        Route("/database_query", database_query, methods=["GET", "POST"]),
+        Mount("/mcp/rpc", app=mcp_http_app),
+    ]
+)
+
+
 
 
 # To start the server:
 if __name__ == "__main__":
-    mcp.run()
+    uvicorn.run(app, host="127.0.0.1", port=8000)
